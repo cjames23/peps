@@ -1,0 +1,823 @@
+PEP: 9999
+Title: Staged Releases for Python Package Indexes
+Author: Cary Hawkins <hawkinscary23@gmail.com>
+PEP-Delegate:
+Discussions-To: https://discuss.python.org/t/pre-pep-staged-releases-separated-from-pep-694/107804
+Status: Draft
+Type: Standards Track
+Topic: Packaging
+Created: 20-Jun-2026
+Post-History: `20-Jun-2026 <https://discuss.python.org/t/pre-pep-staged-releases-separated-from-pep-694/107804>`__
+
+
+Abstract
+========
+
+:pep:`694` lists *staging* among its benefits: upload a release, preview it, and
+publish it when you are ready. This PEP makes that capability concrete and
+specifies it as a feature in its own right, so that it can be adopted
+independently of the larger "Upload 2.0" redesign that :pep:`694` proposes.
+
+Staging is fundamentally a *repository* concern rather than an upload concern. A
+*staged release* is one whose files have been accepted by an index but which
+does not appear in the canonical Simple / JSON index, and therefore cannot be
+installed, until it is published. Because installers and mirrors can only act on
+what the index publishes, staging needs no installer or mirror changes, and it
+is buildable on the existing ("legacy") upload API today.
+
+This PEP specifies: the staged-release lifecycle; how a release enters staging
+(by uploader request or by index policy); a minimal repository-side control API
+to preview, publish, or discard a staged release; and how staged releases are
+(and are not) represented in the :pep:`691` Simple API. As the motivating
+application, it then specifies an index-driven *security gate* that holds a
+freshly uploaded release in the staged state for a bounded window while
+asynchronous malware analysis runs, publishing it on clearance or withdrawing it
+on an adverse verdict. :pep:`694` remains free to drive these same staged states
+through its publishing-session workflow once it lands.
+
+
+Motivation
+==========
+
+Staging is strong enough to stand on its own
+--------------------------------------------
+
+:pep:`694` bundles staging into a comprehensive replacement for the upload API.
+That redesign is valuable, but it is also large, and tying a useful, independent
+capability to its adoption schedule delays a feature that the ecosystem can use
+now. The "upload, preview, publish when ready" idea does not require any of the
+rest of Upload 2.0; this PEP extracts it and pins it down so it can ship on its
+own.
+
+Supply-chain safety: the missing middle
+---------------------------------------
+
+The concrete reason to want staging now is supply-chain safety. Today an
+artifact is installable the instant its upload finishes. Indexes already have
+the two *ends* of a defense: a fast, synchronous reject at upload time (for
+problems that can be detected cheaply and immediately), and reactive
+*quarantine* after a release is already public (for problems found later).
+Staging is the missing middle: a place to run the slower, asynchronous analysis
+that cannot fit in the upload request, *before* the artifact is exposed to the
+world.
+
+This matters because malicious artifacts are typically fetched within the first
+few minutes of being public, so the window between "uploaded" and "flagged" is
+exactly the window in which victims are impacted. Holding a freshly uploaded
+release in a non-public staged state for a bounded window, scanning it
+asynchronously, and only then publishing it (or discarding it on an adverse
+verdict) closes that window.
+
+Why this is separable
+---------------------
+
+Staging is separable from the upload API precisely because it is a *repository*
+concern. A staged release simply does not appear in the canonical Simple / JSON
+index until it is published: you cannot install what you cannot see. No installer
+changes and no mirror changes are required, and the mechanism can be built on the
+legacy upload API as it exists today. The only genuinely new surface is a small
+repository-side control API for previewing, publishing, and discarding staged
+releases, plus an additive, backward-compatible field in the Simple API.
+
+Automated analysis is imperfect, which constrains the design. One scanner author
+reported, during discussion of this proposal, that on the order of 200 automated
+alerts per day distill to roughly 5-10 actionable reports. A gate that
+*unconditionally* blocks publication on any signal, without human review, would
+harm legitimate publishers more than it helps. The security gate specified here
+is therefore advisory and fail-open by default, not a blunt auto-reject.
+
+
+Specification
+=============
+
+The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this
+document are to be interpreted as described in :rfc:`2119`.
+
+Terminology
+-----------
+
+staged release
+    A release whose files have been accepted and stored by an index but which is
+    not present in the canonical, publicly served Simple / JSON index and whose
+    files are not publicly downloadable.
+
+publish
+    To transition a staged release into the canonical index, making it publicly
+    installable.
+
+discard
+    To delete a staged release without ever publishing it.
+
+preview
+    To download and install-test the files of a staged release before it is
+    published.
+
+Lifecycle and states
+--------------------
+
+A staged release occupies exactly one of the following states:
+
+``staged``
+    The release's files are accepted and stored. The release is **not** present
+    in the canonical Simple / JSON index, and its files are **not** publicly
+    downloadable. The release is awaiting publication.
+
+``published``
+    The release is present in the canonical index and is publicly installable.
+    This is a terminal state; to installers it is indistinguishable from a
+    release made without staging, and all normal post-publication rules apply
+    (its files may later be yanked per :pep:`592`, or it may be deleted).
+
+``withdrawn``
+    The release was removed without ever being published; its files are not
+    public and will not be published. This is a terminal state.
+
+A staged release leaves the ``staged`` state in one of two ways, which an index
+**MAY** support independently or together:
+
+* **Uploader-driven.** The owner explicitly publishes the release (the "publish
+  when you are ready" workflow) or discards it, using the `Control API`_.
+
+* **Index-driven.** An index publishes or withdraws the release automatically
+  according to a policy, notably the `Security Gate`_ specified below.
+
+When both apply to the same release (the owner staged a release that an index
+also subjects to a security gate), the index **MUST NOT** publish on the owner's
+request until the gate has cleared; until then the publish request is accepted
+but deferred (see `Control API`_).
+
+Throughout, staging affects only the release being staged. Versions of a project
+that were previously published **MUST** remain available and installable while a
+new version is staged; staging a new version **MUST NOT** make any
+already-published version unavailable. This is what distinguishes staging from
+project-level *quarantine*, which withdraws an entire project.
+
+Entering staging
+----------------
+
+A release can enter the ``staged`` state by either of two routes. Neither
+requires the Upload 2.0 API.
+
+Uploader request
+~~~~~~~~~~~~~~~~~
+
+A client requests that an uploaded file enter a staged release, rather than being
+published immediately, by including an additional form field ``staged`` with the
+value ``true`` in the legacy ``multipart/form-data`` upload request. All files
+uploaded with ``staged=true`` for the same normalized project name and version
+join the same staged release.
+
+An index that supports this PEP and receives ``staged=true`` **MUST** place the
+file in a staged release and **MUST NOT** publish it until the release is
+published through the `Control API`_. An index that supports this PEP but
+receives an upload *without* the field continues to publish immediately, exactly
+as today.
+
+Because a legacy index that predates this PEP will ignore an unknown form field
+and publish immediately, a client **SHOULD** confirm that an index supports
+staging (for example, by issuing a ``GET`` to the staging root described below
+and receiving a success response) before relying on ``staged=true``. An index
+that implements this PEP but is configured to reject staged uploads **SHOULD**
+respond to ``staged=true`` with a ``400 Bad Request`` rather than silently
+publishing.
+
+Index policy
+~~~~~~~~~~~~~
+
+Independently of any uploader request, an index **MAY** place an accepted upload
+into a staged release according to its own policy. This requires no change to the
+upload request: the upload proceeds exactly as today, and the index simply holds
+the result in the staged state. The `Security Gate`_ is the primary example.
+
+Control API
+-----------
+
+The control API is the small, repository-side surface through which a staged
+release is inspected, published, or discarded. It is rooted at a *staging root*
+URL chosen and documented by the index (for example,
+``https://upload.pypi.org/staged/``). The control API is independent of the
+upload API used to create the release.
+
+All control API requests **MUST** be authenticated using the same mechanisms the
+index accepts for uploads (for example, API tokens or Trusted Publishers). A
+request from a principal that does not own the project **MUST** be
+rejected with ``403 Forbidden``. Error responses **SHOULD** use the :rfc:`9457`
+("Problem Details") format. Successful responses use ``application/json``; an
+index **MAY** additionally offer a versioned media type such as
+``application/vnd.pypi.staging.v1+json``.
+
+A staged release is addressed as ``{staging-root}/{project}/{version}/``.
+
+Status
+~~~~~~
+
+A ``GET`` to a staged release's URL returns its current status:
+
+.. code-block:: json
+
+    {
+      "name": "example",
+      "version": "1.2",
+      "state": "staged",
+      "upload-time": "2026-06-20T15:04:00Z",
+      "preview-url": "https://staging.example/9f3c.../simple/",
+      "files": [
+        {
+          "filename": "example-1.2-py3-none-any.whl",
+          "hashes": {"sha256": "9ab30d..."},
+          "size": 1240
+        }
+      ]
+    }
+
+``state``
+    One of ``staged``, ``published``, or ``withdrawn``. An index running a
+    `Security Gate`_ **MAY** report a more specific sub-state in a separate
+    ``gate`` object (see `Reporting and owner alerts`_).
+
+``preview-url``
+    A cryptographically unguessable URL at which the owner can install-test the
+    staged release (see `Preview`_). The index **MUST** make this URL
+    unguessable so that staging it does not amount to publishing it.
+
+A ``GET`` to ``{staging-root}/{project}/`` returns the list of the project's
+currently staged releases, in the same per-release shape.
+
+Publish
+~~~~~~~
+
+A ``POST`` to a staged release's URL with the body:
+
+.. code-block:: json
+
+    {"action": "publish"}
+
+requests publication. If the index can publish immediately, it **MUST** respond
+``200 OK`` with the status body, the ``state`` having become ``published``. If
+publication must wait (for example, an unfinished security gate), the index
+**MUST** respond ``202 Accepted`` with the status body and a ``Location`` header
+pointing back at the staged release URL, which the client can poll. If the index
+refuses publication outright (for example, the gate withdrew the release), it
+**MUST** respond ``409 Conflict``.
+
+Discard
+~~~~~~~
+
+A ``DELETE`` to a staged release's URL discards it. The index marks the release
+``withdrawn``, **SHOULD** purge the uploaded files, and **MUST** respond ``204 No
+Content``. Subsequent requests to the URL **MUST** return ``404 Not Found``.
+
+Preview
+-------
+
+The ``preview-url`` returned by the control API exposes the staged release
+through a private, cryptographically unguessable Simple-API view. It can be
+passed to an installer as an additional index, for example
+``pip install --extra-index-url $PREVIEW_URL example``, allowing the owner to
+download and install-test the release exactly as a consumer eventually will,
+before publishing it. This is the "preview" half of "upload, preview, publish".
+
+The preview view **MUST** be reachable only via the unguessable URL (or with
+owner authentication); the staged release **MUST NOT** be reachable through the
+project's canonical index URLs.
+
+Simple API representation
+-------------------------
+
+This section specifies how staged releases appear in the JSON Simple API
+(:pep:`691`), served today at ``GET /simple/<project>/`` with the media type
+``application/vnd.pypi.simple.v1+json``. The default response continues to
+describe only *published* releases. Staged releases are exposed in two ways: an
+additive ``staged-releases`` key carrying status (publicly, by default), and, for
+clients that explicitly opt in, marked entries in the existing ``files`` array.
+
+Versioning
+~~~~~~~~~~
+
+Adding the ``staged-releases`` key and the ``staged`` file field defined below is
+an additive change. An index that serves them **MUST** increment the *minor*
+``meta.api-version`` of the JSON Simple API accordingly (for example, from
+``1.4`` to a higher ``1.x``). Per :pep:`691`, minor version increments are
+backward compatible and clients **MUST** ignore object keys they do not
+recognise, so existing installers are unaffected.
+
+The ``staged-releases`` key
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An index **SHOULD** add a top-level ``staged-releases`` key to the project detail
+response. Its value is an array of objects, one per staged release. The key is
+part of the public response and **SHOULD** be served to unauthenticated
+requests, so that maintainers, tooling, dashboards, and auditors can observe
+what is pending rather than discovering it only through owner-only access. An
+index that considers the existence of a forthcoming version sensitive **MAY**
+restrict the key, but the default **SHOULD** be public exposure. A representative
+response:
+
+.. code-block:: json
+
+    {
+      "meta": {"api-version": "1.5", "_last-serial": 24217303},
+      "name": "example",
+      "versions": ["1.0", "1.1"],
+      "files": [
+        {
+          "filename": "example-1.1-py3-none-any.whl",
+          "url": "https://files.pythonhosted.org/.../example-1.1-py3-none-any.whl",
+          "hashes": {"sha256": "5e2f1c..."},
+          "requires-python": ">=3.9",
+          "size": 1234,
+          "upload-time": "2026-06-19T18:02:00.000000Z",
+          "yanked": false
+        }
+      ],
+      "project-status": {"status": "active"},
+      "staged-releases": [
+        {
+          "version": "1.2",
+          "status": "scanning",
+          "upload-time": "2026-06-20T15:04:00.000000Z",
+          "files": [
+            {
+              "filename": "example-1.2-py3-none-any.whl",
+              "hashes": {"sha256": "9ab30d..."},
+              "requires-python": ">=3.9",
+              "size": 1240,
+              "core-metadata": {"sha256": "1f0c77..."}
+            }
+          ]
+        }
+      ]
+    }
+
+Each object in ``staged-releases`` has the following keys:
+
+``version`` (**required**)
+    The version string of the staged release, conforming to the `version
+    specifiers specification
+    <https://packaging.python.org/en/latest/specifications/version-specifiers/>`_.
+    This version **MUST NOT** also appear in the top-level ``versions`` array
+    until the release is published.
+
+``status`` (**required**)
+    Why the release is currently staged: ``draft`` (awaiting an uploader-driven
+    publish), ``scanning`` (a security gate is analysing it within the hold
+    window), or ``held`` (a security gate flagged it and it is under review).
+
+``upload-time`` (**recommended**)
+    A timestamp, in the same format as the ``upload-time`` of a published file,
+    indicating when the staged release was accepted. This lets consumers reason
+    about how long a release has been staged.
+
+``files`` (**recommended**)
+    An array of file objects describing the files in the staged release. These
+    objects reuse the published file-object field names (``filename``,
+    ``hashes``, ``size``, ``requires-python``, ``core-metadata``,
+    ``data-dist-info-metadata``), with one deliberate difference: in the public
+    response they **MUST NOT** include a ``url`` key. The metadata is exposed so
+    tooling can see what is pending; the artifacts themselves are withheld. This
+    is the one case in which a Simple API file object omits ``url``.
+
+The top-level ``files`` and ``versions`` arrays **MUST** continue to describe
+only published releases in the default response, so existing installers resolve
+exactly as they do today.
+
+Installer opt-in
+~~~~~~~~~~~~~~~~
+
+To let a user *deliberately* consume staged releases (beyond the owner's private
+``preview-url``), this PEP defines an opt-in on both sides:
+
+* **Client request.** A client signals that it accepts staged releases by adding
+  the query parameter ``include-staging=true`` to the project detail request,
+  for example ``GET /simple/example/?include-staging=true`` (an index **MAY**
+  document an equivalent signal, such as a media-type parameter). Installers
+  **SHOULD** expose this behind an explicit, off-by-default, per-invocation flag;
+  the **RECOMMENDED** spelling is ``--allow-staging``, by analogy with ``--pre``
+  for pre-releases.
+
+* **Server response.** When an index honours such a request, it **MAY** include
+  the files of staged releases in the top-level ``files`` array, each marked with
+  a ``"staged": true`` field and carrying a normal ``url``. A file object without
+  a ``staged`` key, or with ``"staged": false``, denotes a published file as
+  before. The ``staged-releases`` status key remains present regardless.
+
+Because a staged release has, by definition, not yet been published, consuming
+one is riskier than normal installation. Installers **SHOULD** keep the opt-in
+explicit and per-invocation, and **SHOULD** surface to the user when a staged
+file is selected. An index **MAY** require authentication for the opt-in response
+and **MAY** decline it; in particular, an index running a security gate **MAY**
+refuse to serve not-yet-scanned artifacts to arbitrary opted-in clients,
+restricting access to the owner's ``preview-url``.
+
+
+Security Gate
+=============
+
+The security gate is the motivating application of staging: an index-driven use
+in which the reason a release is staged is to let asynchronous malware analysis
+flag it before the public can install it. It uses the lifecycle, control API, and
+Simple API representation defined above; this section adds only the policy
+specific to it.
+
+Enrollment
+----------
+
+Whether a given upload is staged for a security gate is determined by index
+policy. To balance coverage against disruption to trusted publishers, this PEP
+specifies a hybrid policy. An index that implements the security gate:
+
+* **MUST** stage the **first release of a new project** (a project with no
+  previously published files), and **MUST NOT** allow this initial staging to be
+  bypassed. New projects are the highest-risk surface for typosquatting and
+  dependency-confusion attacks and have no reputation to trade on, so the first
+  release is always scanned before it can become public.
+
+* **MUST NOT** honour any request to disable staging for a project until that
+  project has at least one release that has completed the security gate
+  **without being flagged**. The ability to opt out is thus *earned* by a clean
+  first release, never granted up front. An index **MAY** require more than one
+  clean release (an *initial reputation period*) before honouring such a request,
+  and **SHOULD** continue to stage a new project's releases until that bar is met.
+
+* **SHOULD**, once a project has earned it, offer the project's maintainers the
+  ability to opt out of (and back in to) the security gate for future releases,
+  gated behind explicit maintainer action.
+
+* **SHOULD** offer **established projects** that predate this policy the same
+  explicit opt-in / opt-out control; such projects are not gated by default.
+
+* **MAY** stage any project's release, regardless of opt-out status, when the
+  index's own risk signals (for example, a new or unusual publishing identity)
+  warrant it, and **MUST** document any such index-initiated staging.
+
+An index **MUST** document its enrollment policy. The specific reputation
+thresholds and risk signals are index-specific and are intentionally left out of
+this PEP, because they will evolve faster than the PEP process and will differ
+between indexes.
+
+Hold window and fail-open behavior
+----------------------------------
+
+An index **MUST** define a maximum *hold window*: the longest it will keep a
+release staged for the security gate before publishing it regardless of analysis
+status. The window **SHOULD** be short enough that publishing remains a good
+experience for legitimate maintainers and long enough to be useful against
+automated attacks; the appropriate value is operational and is left to the index
+(see `Open Issues`_).
+
+If analysis has not produced a decision by the end of the hold window, the index
+**MUST** publish the release (fail open). Failing open guarantees that the
+security gate can never make publishing *less reliable* than it is today (only
+slightly slower for gated uploads), and ensures that an outage or backlog in the
+analysis pipeline cannot become a denial of service against publishers. An index
+**MAY**, and **SHOULD**, publish as soon as it obtains clearance rather than
+always waiting for the full window.
+
+Gate semantics
+--------------
+
+An adverse analysis signal does not, by itself, require any particular action. On
+such a signal, an index **MAY**:
+
+* treat it as *advisory* and publish anyway, recording the signal for operator
+  review; or
+
+* keep the release ``staged`` (reporting ``held``) pending human review, beyond
+  what the hold window would otherwise allow; or
+
+* ``discard`` the release (withdraw it).
+
+This PEP deliberately does **not** mandate automatic blocking on a scanner
+signal. The false-positive rates discussed in `Motivation`_ make unattended
+auto-rejection hazardous, and whether an index can act on signals automatically
+depends on its human-review capacity. What this PEP standardizes is the *window*
+in which such a decision can be made before the artifact becomes public, not the
+index's internal analysis. This PEP does not define the format, transport, or
+content of analysis results, nor the set of permissible analyzers.
+
+Reporting and owner alerts
+--------------------------
+
+An index running the security gate:
+
+* **SHOULD** report gate-specific state in the control API status response, via a
+  ``gate`` object (for example, ``{"gate": {"status": "held"}}``) and via the
+  ``status`` value of the corresponding ``staged-releases`` entry (``scanning``
+  or ``held``; see `Simple API representation`_).
+
+* **MUST** make the state observable to the authenticated owner of the project,
+  and **SHOULD** notify the owner when a release is staged, published, held, or
+  withdrawn. In particular, when a release is withheld or discarded because it
+  was flagged, the index **SHOULD** alert the owner so that a false positive can
+  be contested rather than silently dropped.
+
+* **MAY** provide an appeals or re-review path for held and withdrawn releases;
+  the existence and shape of such a path is index-specific.
+
+
+Relationship to PEP 694
+=======================
+
+:pep:`694` introduces staging as one feature of a comprehensive new upload API.
+This PEP specifies the same underlying capability ("a release that exists but is
+not yet public, which the owner can preview and then publish or discard") as a
+standalone, repository-side feature, so that it can be adopted without waiting
+for the rest of Upload 2.0.
+
+The two are designed to be coherent rather than competing:
+
+* The `Control API`_ here is intentionally minimal and built on the legacy upload
+  API. :pep:`694`'s publishing-session workflow is a richer way to drive the same
+  ``staged`` -> ``published`` / ``withdrawn`` lifecycle. An index that adopts both
+  would expose two ways to create and publish a staged release; the resulting
+  states, the `Simple API representation`_, and the `Preview`_ mechanism are the
+  same.
+
+* Neither PEP normatively depends on the other, and this PEP does not modify
+  :pep:`694`. Should both be adopted, :pep:`694` can simply reference the
+  staged-release semantics defined here instead of restating them.
+
+In short, this PEP answers "what is a staged release, and how do I preview,
+publish, or discard one" at the repository layer; :pep:`694` answers "what is the
+modern way to upload one".
+
+
+Rationale
+=========
+
+Why a repository-side feature
+-----------------------------
+
+Staging is separable from the upload-API redesign because its defining behavior
+is a repository behavior: the release is absent from the canonical index until
+published. Framing it this way is what lets it require no installer or mirror
+changes and be built on the legacy upload API today. The only new surface is the
+small `Control API`_ and an additive Simple API field, both of which can be
+implemented and shipped on their own timeline.
+
+Why a minimal control API rather than a new upload API
+------------------------------------------------------
+
+A staged release still has to be created, published, and discarded somehow. This
+PEP deliberately adds the smallest surface that supports those actions (a single
+``staged`` upload field plus three control verbs) rather than a second full
+upload API, both to keep the feature shippable now and to avoid competing with
+:pep:`694`, which is the right place for a comprehensive upload redesign.
+
+Why both control models
+-----------------------
+
+The "upload, preview, publish when ready" workflow is uploader-driven, while the
+security gate is index-driven, but both are just different triggers for the same
+``staged`` -> ``published`` / ``withdrawn`` transition. Specifying one lifecycle
+with two ways out keeps the model small and lets a single implementation serve
+both the developer-experience benefit and the security benefit.
+
+Index-side staging versus client-side cooldown
+----------------------------------------------
+
+Client-side *cooldowns*, in which an installer ignores releases younger than some
+threshold, already exist. uv, for example, can exclude distributions uploaded
+after a given point in time via its ``--exclude-newer`` option, which can be used
+to hold back brand-new releases. Cooldowns are valuable, and this PEP is designed
+to complement rather than replace them.
+
+They cannot, however, be the whole answer to the supply-chain problem, because a
+release published without staging is *publicly present on the index* the moment
+it is uploaded. Anyone whose installer has no cooldown configured, and any
+attacker harvesting fresh uploads directly, can fetch it. Only an index-side hold
+actually keeps an artifact from being publicly available. The two stack cleanly:
+an index hold protects the whole ecosystem by default, while a client cooldown
+lets individual consumers add further conservatism on top. (The ``--allow-staging``
+opt-in is the inverse control, for consumers who instead want the newest releases
+sooner.)
+
+Why hybrid enrollment
+---------------------
+
+Gating *every* release of *every* project would maximize coverage but was judged
+too disruptive: it abruptly changes the immediate behavior of the legacy upload
+path for the whole ecosystem and imposes a hold on the trusted, established
+projects that account for most uploads and almost none of the risk. Pure opt-in
+is useless against the threat model, because attackers will never opt in. The
+hybrid concentrates mandatory coverage where the risk and payoff are highest
+(brand-new projects and first releases), while letting established projects choose
+and letting indexes layer their own risk signals on top.
+
+Why fail-open
+-------------
+
+Failing open ensures the security gate is, at worst, a brief delay rather than a
+new way for publishing to break. It removes any incentive for the index to
+under-invest in analysis throughput at publishers' expense, and prevents an
+analysis outage from halting the ecosystem. The benefit comes from the
+*opportunity* to catch artifacts in the window, not from a promise to catch all
+of them.
+
+Why not reuse the "yanked" marker
+---------------------------------
+
+A suggestion during discussion was to repurpose :pep:`592` yanking to keep a
+release out of the way during review. It does not fit, because yanking solves a
+different problem at the opposite end of a release's life.
+
+Yanking marks an *already-published* file (through the ``yanked`` field of the
+JSON Simple API, or ``data-yanked`` in HTML; PyPI surfaces this per release)
+without removing it: a yanked file stays listed in the index and remains
+downloadable. Its only effect is on resolution. Per :pep:`592`, an installer
+ignores a yanked file when a non-yanked file satisfies the requirement, and
+selects one only when it is the sole match for an exact-version pin (``==`` or
+``===``) or a lock entry, emitting a warning when it does. The purpose is to let
+an author soft-delete a broken version *without* breaking users who have already
+pinned to it.
+
+Staging is the opposite case. The release has not been published, and the point
+is that nobody, pinned or not, can install it yet. A yanked file is still public
+and still installable by anyone who requests it precisely, which is exactly what
+staging must prevent. Yanking is the right tool *after* publication, and the
+wrong one *before* it.
+
+
+Backwards Compatibility
+=======================
+
+The legacy upload API is unchanged except for one new, optional form field,
+``staged``; uploads that omit it behave exactly as today. Installers, mirrors,
+and the upload client require no changes to keep working: a staged release is
+absent from the canonical index until published. Clients already tolerate unknown
+keys in :pep:`691` JSON, so the additive ``staged-releases`` key and ``staged``
+file field (served under an incremented minor ``api-version``) are non-breaking,
+and the ``--allow-staging`` opt-in is a new, optional installer capability.
+
+The one behavioral change is for publishers of *gated* uploads: a gated release
+is not installable the instant it is accepted, but only after it clears the
+security gate or the hold window elapses. Because established, opted-out projects
+are not gated by default, the overwhelming majority of existing workflows are
+unaffected; new projects and first releases experience a bounded delay on their
+initial publish. Indexes that do not implement this PEP are unaffected; the
+feature is optional for index operators.
+
+
+Security Implications
+=====================
+
+* **Fail-open is a known limitation, by design.** A determined attacker can
+  attempt to publish during an analysis backlog and be auto-published when the
+  window elapses. Staging raises the cost and reduces the reach of automated
+  attacks; it is not a guarantee of interdiction. This is accepted in exchange
+  for not making publishing unreliable.
+
+* **Preview and staged files must not leak.** Staged files must be reachable only
+  through the cryptographically unguessable ``preview-url`` or with owner
+  authentication, never through guessable, unauthenticated URLs. Otherwise
+  staging would merely relocate, rather than remove, public availability.
+
+* **Silent-publish on non-supporting indexes.** An uploader that sets
+  ``staged=true`` against an index that does not implement this PEP will have the
+  release published immediately, because the unknown field is ignored. Clients
+  **SHOULD** confirm staging support before relying on the field, and supporting
+  indexes that reject staged uploads **SHOULD** return an error rather than
+  publishing.
+
+* **Status exposure is a deliberate, recommended disclosure.** Exposing the
+  existence of a staged release (its version and status) publicly via
+  ``staged-releases`` tells the world a project is about to publish a given
+  version. This is judged an acceptable, even beneficial, transparency trade-off,
+  and avoids owner-only visibility; an index that considers a forthcoming version
+  sensitive **MAY** restrict the field. In all cases the model withholds staged
+  *artifacts*, not their *status*, from the public surface.
+
+* **Opting in to staged releases carries informed risk.** The recommended
+  ``--allow-staging`` opt-in lets a user deliberately install releases that have
+  not been published (for a security gate, not-yet-scanned artifacts). It is off
+  by default and explicit, analogous to ``--pre``; indexes **MAY** further
+  restrict which staged artifacts they serve to opted-in clients.
+
+* **No new denial-of-service vector against publishers.** Because the hold window
+  is bounded and the index fails open, neither an analysis outage nor a flood of
+  uploads can indefinitely withhold a legitimate release.
+
+
+How to Teach This
+=================
+
+For most maintainers of existing projects, nothing changes: releases publish as
+before unless they opt in. The teaching surface is small and targeted:
+
+* **Maintainers who want to test before publishing** can be taught the
+  "upload, preview, publish" workflow: upload with staging, install-test via the
+  ``preview-url``, then publish or discard.
+
+* **New project authors** should be told that their first release will be held
+  briefly for automated security review before it becomes installable, where to
+  watch its status, and that they can opt out for future releases once a release
+  has cleared review without being flagged.
+
+* **Users who want the newest releases** can be taught the ``--allow-staging``
+  opt-in, and warned that it installs releases that have not been published.
+
+* **Tooling authors** who want visibility into not-yet-public releases can be
+  pointed at the public ``staged-releases`` key, with the caveat that it carries
+  status, not artifacts.
+
+The unifying idea is that "staged" always means the same thing, a release that
+exists but is not yet public, whether it is the owner who will publish it when
+ready or an index that will publish it once a security gate clears.
+
+
+Reference Implementation
+========================
+
+There is no reference implementation yet. The natural home for one is Warehouse
+(the software that powers PyPI), which already performs asynchronous malware
+analysis on uploads and already has the notion of project quarantine; staging
+would interpose the held state between upload acceptance and Simple API
+publication, and add the control API for previewing, publishing, and discarding.
+
+
+Rejected Ideas
+==============
+
+Coupling staging to the Upload 2.0 API
+    Rejected as the whole point of this PEP. Staging is a repository concern that
+    can ship on the legacy upload API; tying it to the larger redesign would delay
+    it for no technical reason.
+
+A second full upload API
+    Rejected in favour of the minimal `Control API`_. A comprehensive upload
+    redesign is :pep:`694`'s remit; duplicating it here would be redundant and
+    would compete with that work.
+
+Relying solely on client-side cooldowns
+    Installers such as uv already let users hold back recent releases (for
+    example, uv's ``--exclude-newer``). Such cooldowns are useful and explicitly
+    complementary to this PEP, but they cannot be the sole mechanism: they leave
+    the artifact publicly available on the index regardless of any individual
+    installer's behavior.
+
+Mandatory gating for all releases
+    Rejected as too disruptive to the established, low-risk majority of
+    publishers. The hybrid enrollment policy captures most of the benefit at a
+    fraction of the cost.
+
+Mandatory automatic rejection on any scanner signal
+    Rejected because reported false-positive rates make unattended auto-rejection
+    harmful to legitimate publishers. Acting on signals is left to index policy.
+
+Renaming the feature to "quarantine"
+    Considered, but "quarantine" already denotes an index withdrawing an entire
+    *project* (including previously published versions), whereas staging holds
+    only a single not-yet-published release.
+
+A fixed, PEP-mandated hold window
+    Rejected. A short window (minutes) blunts the most common automated attacks
+    with minimal friction; a long window (hours to a day) catches slower-moving
+    abuse but is more disruptive. The right point is operational and will change
+    over time, so the window is left to the index.
+
+
+Open Issues
+===========
+
+* **Hold-window guidance.** Should this PEP offer a recommended default or range
+  for the security-gate hold window, or leave it entirely to indexes? Discussion
+  suggested minutes-long windows meaningfully reduce repeat abuse while malware
+  often lives only a few minutes, whereas materially higher assurance may require
+  windows measured in hours.
+
+* **Capability discovery for the ``staged`` upload field.** This PEP relies on
+  clients confirming staging support out of band before setting ``staged=true``.
+  A standard capability-advertisement mechanism for the legacy upload API may be
+  worth defining.
+
+* **Standardizing the preview and staging-view format.** The exact format of the
+  ``preview-url`` view, the ``include-staging`` signal, and the ``staged-releases``
+  schema could be tightened, and potentially aligned with whatever :pep:`694`
+  settles on for stage previews.
+
+* **Standardizing analysis-result exchange.** This PEP treats analysis as an
+  index-internal concern. A future PEP could define how an index ingests results
+  from third-party analyzers.
+
+* **Token / credential expiry.** Discussion raised adjacent index-security
+  improvements such as default expiry dates for upload tokens. These are out of
+  scope here and noted only as related future work.
+
+* **Appeals and re-review.** Whether to standardize any part of the held /
+  withdrawn appeals workflow, or leave it wholly index-specific.
+
+
+Acknowledgements
+================
+
+Thanks to the participants in the pre-PEP discussion whose feedback shaped this
+proposal, including Ee Durbin, Barry Warsaw, Alyssa Coghlan, Laurie O, Steve
+Dower, and Kamil (kam193), and to the authors of :pep:`694`, whose framing of
+staging as a benefit of Upload 2.0 prompted this extraction.
+
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
