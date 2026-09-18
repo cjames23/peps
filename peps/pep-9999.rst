@@ -1,0 +1,749 @@
+PEP: 9999
+Title: A sources table in pyproject.toml for dependency source redirection
+Author: Cary Hawkins <hawkinscary23@gmail.com>
+Sponsor: TBD
+Discussions-To: Pending
+Status: Draft
+Type: Standards Track
+Topic: Packaging
+Created: 16-Sep-2026
+Post-History:
+
+
+Abstract
+========
+
+This PEP specifies a new top-level table in ``pyproject.toml`` named
+``sources``. The table redirects individual dependencies to alternative
+origins (a local directory, a Git repository, a URL, or a specific package
+index) for the duration of development, without altering the metadata of any
+distribution the project builds.
+
+Sources are keyed by project name and are never included in built
+distributions. A project may therefore declare ``dependencies =
+["foo-core"]`` in ``[project]``, which is what consumers of the published
+wheel resolve, while declaring separately that in this checkout ``foo-core``
+is satisfied by the sibling directory ``libs/core``.
+
+
+Motivation
+==========
+
+Standardized packaging metadata has no way to express that a dependency should
+be resolved from somewhere other than an index while a project is being
+developed, so that every project manager supporting multi-package repositories
+has added a table of its own for the purpose, none of which interoperate.
+
+Multi-package repositories
+--------------------------
+
+Consider a repository with the following layout, which is a common shape for
+a Python monorepo::
+
+    foo/
+    ├── libs/
+    │   ├── core/
+    │   │   └── pyproject.toml     # foo-core
+    │   └── client/
+    │       └── pyproject.toml     # foo-client
+    └── services/
+        └── api/
+            └── pyproject.toml     # foo-api
+
+``foo-api`` depends on ``foo-client``, which depends on ``foo-core``. A
+developer working in this repository expects ``foo-api`` to be built and
+tested against the working tree of its siblings rather than against whatever
+is published on an index. There are four ways that this can be arranged
+today.
+
+1. A direct reference into the published metadata, so that
+   ``dependencies = ["foo-client @ file:///home/dev/foo/libs/client"]`` in
+   ``[project]`` will work locally while producing a wheel that nobody else
+   is able to install, the path being absolute, machine-specific, and
+   recorded verbatim in ``Requires-Dist``. What we find here is that
+   :pep:`508` direct references are themselves published metadata, which
+   makes them ill-suited to a redirection that is only meant to hold during
+   development, and yet they remain the only standardized mechanism there is.
+
+2. One can install out of band, running ``pip install -e libs/client`` before
+   ``pip install -e services/api``, which does work, though the relationship
+   between the two has not been declared anywhere. It cannot be validated, it
+   is invisible to editors and to CI, it is not reproducible, and it reverts
+   to the published version whenever a step is skipped or the ordering
+   changes.
+
+3. One can use a tool-specific table. ``[tool.uv.sources]`` and
+   ``[tool.hatch.sources]`` both solve the problem correctly, and neither is
+   readable by the other, so that the structure of the repository, which is a
+   property of the repository rather than of any tool that happens to be
+   pointed at it, ends up encoded in a vendor namespace.
+
+4. One can modify the import path, adding sibling directories to ``sys.path``,
+   ``PYTHONPATH``, or ``.pth`` files, which bypasses packaging entirely and
+   fails as soon as anything requires real metadata.
+
+Of these, the third is the only one that is at once declarative and correct,
+and it is for that reason that tools have converged upon it.
+
+Existing implementations
+------------------------
+
+What we find across the ecosystem is that the concept itself has settled,
+and that what differs between one tool and the next is the syntax by which
+it is written down.
+
+* uv defines ``[tool.uv.sources]``, supporting ``path``, ``git``, ``url``,
+  and ``index`` entries, with marker- and extra-conditional variants.
+
+* Hatch defines ``[tool.hatch.sources]`` and a per-environment
+  ``[tool.hatch.envs.<ENV>.sources]``, with the same four kinds, a string
+  shorthand for paths, and entry-by-entry inheritance between environments.
+
+* Poetry attaches ``path``/``develop``, ``git``/``branch``/``rev``/``tag``,
+  ``url``, and ``source`` keys to entries in ``[tool.poetry.dependencies]``.
+  Since Poetry 2.0, when a :pep:`621` ``[project]`` table is present,
+  ``tool.poetry.dependencies`` is documented as existing only "to enrich
+  ``project.dependencies`` for locking", which is the same division this PEP
+  generalizes.
+
+* PDM expresses local and VCS dependencies through direct references together
+  with a separate index configuration.
+
+There are then four tools, each of which has arrived at its own table for
+what amounts to the same thing. This is the situation that motivated
+:pep:`621` for project metadata and :pep:`735` for development dependency
+groups, and it is a situation that warrants the same treatment here.
+
+Consequences of the status quo
+------------------------------
+
+* Tools that are not project managers cannot participate. Editors, language
+  servers, test runners, dependency auditors, license scanners, and
+  ``pyproject.toml`` validators can all read ``[project.dependencies]``, yet
+  none of them can discover that ``foo-client`` is satisfied by
+  ``libs/client`` without implementing support for each project manager
+  separately, nor can a first-time contributor obtain a working checkout with
+  a standards-compliant installer, the information needed to build it not
+  being in any standard location.
+
+* A repository that builds with one tool and manages environments with
+  another must express the same relationships twice and keep the copies in
+  sync.
+
+* Because direct references are the only portable mechanism, projects
+  continue to reach for them and continue to publish distributions that
+  cannot be installed.
+
+
+Rationale
+=========
+
+Sources do not declare dependencies
+-----------------------------------
+
+The central design decision here is that ``[sources]`` does not declare
+dependencies at all, but declares instead where dependencies that have been
+declared elsewhere are to be obtained from, so that
+``[project.dependencies]`` remains the complete published statement of what a
+project requires while ``[sources]`` sits over it as an overlay applied by
+whichever tool populates the development environment.
+
+This preserves an invariant that the direct-reference approach violates:
+
+    The metadata of a built distribution is identical whether or not a
+    ``[sources]`` table is present.
+
+Because of that invariant, a wheel built from a multi-package checkout records
+``Requires-Dist: foo-client>=1.2``, which any consumer can resolve, even
+though the developer who built it was working against ``libs/client``, and the
+table can be added to an existing project without affecting what it publishes.
+
+Why a top-level table rather than a key in ``[project]``
+--------------------------------------------------------
+
+``[project]`` is, by :pep:`621`, the set of fields a build backend reads and
+translates into core metadata. Sources are never translated into core
+metadata, so a ``[project.sources]`` key would be the only member of that
+table that backends are required to ignore, which invites implementation
+errors and conflicts with the ``dynamic`` mechanism.
+
+There is also the repository root to consider, which frequently has no
+``[project]`` table at all, serving only as a container for repository-wide
+configuration such as ``[dependency-groups]``, and it must be possible to
+declare sources in such a file. It was for the same reason that :pep:`735`
+established this precedent for ``[dependency-groups]``.
+
+Why one table covers paths, Git, URLs, and indexes
+--------------------------------------------------
+
+A local path is the multi-package case, though the underlying need is a
+broader one, covering also the tracking of an upstream branch while waiting
+on a release, the testing against a patched build, and the resolving of
+internal packages from a private index while everything else continues to
+come from PyPI. That is to say that these are the same operation applied to
+different origins, which is why both reference implementations have already
+unified them, and to separate them here would give us three tables governed
+by identical rules of precedence.
+
+
+Specification
+=============
+
+The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this
+document are to be interpreted as described in :rfc:`2119`. The lowercase
+words "required" and "optional" in the field descriptions below are used in
+their ordinary sense and carry no special meaning.
+
+This PEP defines a new table in ``pyproject.toml`` named ``sources``. The
+table MAY appear in a ``pyproject.toml`` that has no ``[project]`` table, in
+which case it governs that file's own dependency groups and does not reach the
+projects in any subdirectory.
+
+Each key of ``[sources]`` is the name of a project whose requirements are to
+be redirected. Keys MUST be
+`valid non-normalized names <https://packaging.python.org/en/latest/specifications/name-normalization/#valid-non-normalized-names>`__
+and MUST be
+`normalized <https://packaging.python.org/en/latest/specifications/name-normalization/#normalization>`__
+before comparison. If two keys are equal after normalization, tools MUST
+report an error. Tools SHOULD present the original, non-normalized name to
+users.
+
+The value of each key is either a source entry or a non-empty array of source
+entries. A bare source entry is equivalent to an array containing that single
+entry.
+
+.. code:: toml
+
+    [sources]
+    foo-core = { path = "libs/core", editable = true }
+    foo-client = "libs/client"
+    httpx = { git = "https://github.com/encode/httpx", tag = "0.28.1" }
+
+Source entries
+--------------
+
+A source entry is either a string or a table.
+
+A string is shorthand for a path source: ``name = "libs/core"`` is equivalent
+to ``name = { path = "libs/core" }``. A string entry MUST NOT be empty.
+
+A table MUST contain exactly one kind key, which selects the kind of source.
+The kind keys are ``path``, ``git``, ``url``, and ``index``. A
+table with no kind key, or with more than one, is an error and tools MUST
+reject it.
+
+In addition to the keys defined for its kind, any table entry MAY carry the
+selector keys ``marker``, ``extra``, and ``group``, defined in `Selectors`_.
+
+Tools MUST report an error for an unrecognized combination of kind keys, and
+SHOULD report a warning for any other unrecognized key, so that typographical
+errors are caught while leaving room for future extension.
+
+Path sources
+''''''''''''
+
+.. code:: toml
+
+    [sources]
+    foo-core = { path = "libs/core", editable = true }
+    foo-data = { path = "vendor/foo_data-1.0-py3-none-any.whl" }
+    foo-plugin = { path = "vendor/monorepo", subdirectory = "plugins/foo" }
+
+``path``
+    Required, string, non-empty. A path to a directory containing a project,
+    to a wheel, or to a source distribution.
+
+    A relative path MUST be resolved against the directory containing the
+    ``pyproject.toml`` in which the table appears, and MUST be interpreted
+    with ``/`` as the separator regardless of platform. Relative paths MAY
+    traverse above that directory, which is required for repositories in
+    which projects are siblings rather than children.
+
+    An absolute path MAY be used, but is not portable between checkouts.
+    Authors SHOULD NOT use absolute paths in a table committed to version
+    control, and tools SHOULD warn when one is used.
+
+``editable``
+    Optional, boolean, default ``false``. When ``true``, the project at
+    ``path`` MUST be installed as an editable install per :pep:`660`, and
+    ``path`` MUST refer to a directory containing a project. Tools MUST
+    report an error if it refers to a wheel or source distribution.
+
+``subdirectory``
+    Optional, string. The path, relative to ``path``, of the directory
+    containing the project's ``pyproject.toml``. Used when a repository or
+    archive contains a project below its root.
+
+Git sources
+'''''''''''
+
+.. code:: toml
+
+    [sources]
+    httpx = { git = "https://github.com/encode/httpx", tag = "0.28.1" }
+    foo-core = { git = "ssh://git@example.com/foo.git", branch = "main",
+                  subdirectory = "libs/core" }
+
+``git``
+    Required, string, non-empty. The URL of a Git repository. The value MUST
+    NOT include the ``git+`` prefix used by :pep:`508` direct references;
+    tools add it when constructing a URL.
+
+``rev``, ``tag``, ``branch``
+    Optional, string. These keys are mutually exclusive, and tools MUST
+    report an error if more than one is present. When none is present, the
+    repository's default branch is used.
+
+``subdirectory``
+    Optional, string, as for path sources.
+
+Because a ``branch`` is not a fixed revision, tools SHOULD record the resolved
+commit in any lock file they produce.
+
+URL sources
+'''''''''''
+
+.. code:: toml
+
+    [sources]
+    foo-core = { url = "https://files.example.com/foo_core-1.0-py3-none-any.whl" }
+
+``url``
+    Required, string, non-empty. The URL of a wheel or source distribution.
+    Tools MAY refuse schemes other than ``https``.
+
+``subdirectory``
+    Optional, string, meaningful when the URL names an archive containing a
+    project below its root.
+
+Index sources
+'''''''''''''
+
+.. code:: toml
+
+    [sources]
+    foo-core = { index = "https://pypi.internal.example.com/simple" }
+
+``index``
+    Required, string, non-empty. The URL of a :pep:`503` simple repository.
+
+An index source does not change the requirement; it constrains where the
+requirement may be satisfied from. Tools MUST resolve the named project
+exclusively from the given index, and MUST NOT fall back to any other
+configured index for that project.
+
+Adding the URL to the set of searched indexes, for example as an additional
+``--extra-index-url``, does not satisfy this requirement. Doing so leaves the
+project open to dependency confusion, in which a public index serves a
+higher-versioned package under the same name and wins resolution. See
+`Security Implications`_.
+
+An index source places no constraint on any project other than the one it is
+keyed by.
+
+Selectors
+---------
+
+Any table entry MAY carry selector keys, which restrict the circumstances
+under which the entry applies.
+
+``marker``
+    Optional, string. A :pep:`508` environment marker. The entry applies only
+    when the marker evaluates to true for the environment being installed
+    into.
+
+``extra``
+    Optional, string. The entry applies only to occurrences of the
+    requirement within the named key of ``[project.optional-dependencies]``.
+
+``group``
+    Optional, string. The entry applies only to occurrences of the
+    requirement within the named :pep:`735` Dependency Group.
+
+When the value of a key in ``[sources]`` is an array, entries are considered
+in order and the first entry whose selectors all match is applied. If no entry
+matches, the requirement is not redirected. Tools SHOULD warn when more than
+one entry in an array could apply to the same requirement in the same
+environment, since such a table is usually a mistake even though its meaning
+is well defined.
+
+.. code:: toml
+
+    [sources]
+    torch = [
+      { index = "https://download.pytorch.org/whl/cu124",
+        marker = "sys_platform == 'linux'" },
+      { index = "https://download.pytorch.org/whl/cpu" },
+    ]
+
+Applying sources
+----------------
+
+A source applies to a requirement when the requirement's project name, after
+normalization, equals the normalized key of the source, and the selectors of
+the applicable entry match.
+
+Sources MUST be applied to requirements appearing in:
+
+* ``project.dependencies``
+* ``project.optional-dependencies``
+* ``dependency-groups`` (:pep:`735`)
+
+Tools MAY additionally apply sources to development dependency lists of their
+own definition, such as per-environment requirement lists.
+
+Sources MUST NOT be applied to ``build-system.requires``. Which backend, and
+which version of that backend, builds a distribution is a property of the
+distribution produced, and allowing a development-only table to change it
+would break the invariant that ``[sources]`` cannot affect build output. See
+`Open Issues`_ for discussion, as one reference implementation currently
+behaves otherwise.
+
+Direct and transitive requirements
+''''''''''''''''''''''''''''''''''
+
+Tools MUST apply sources to every requirement encountered while resolving the
+current project, not only to the requirements the current project declares
+directly.
+
+This rule is what makes multi-package repositories work. If ``foo-api``
+declares ``foo-client``, and ``foo-client`` in turn declares ``foo-core``,
+then redirecting only ``foo-client`` to a local path would leave
+``foo-core`` to be resolved from an index, silently mixing a local checkout
+with a published release. A source for ``foo-core`` declared by ``foo-api``
+applies to that transitive requirement.
+
+This rule concerns which requirements a table may affect. It does not change
+which tables are read, which is governed by `Sources are project-local`_: a
+tool reads the ``[sources]`` table of the project being developed and no
+other.
+
+Extras and markers
+''''''''''''''''''
+
+When a source is applied, the extras requested by the original requirement
+MUST be preserved. The original requirement's own environment marker MUST
+continue to determine whether the requirement is installed at all. Applying a
+source never causes a requirement to be installed in an environment where it
+would otherwise be skipped.
+
+Version specifiers
+''''''''''''''''''
+
+Path, Git, and URL sources identify a distribution directly, so that the
+requirement's version specifier no longer participates in resolution. Tools
+SHOULD verify that the version obtained satisfies the original specifier, and
+SHOULD report an error when it does not, a mismatch usually indicating that
+either the specifier or the source has gone out of date. An index source does
+not bypass resolution, so its version specifier applies unchanged.
+
+Precedence
+----------
+
+A requirement that already carries a :pep:`508` direct reference
+(``name @ url``) MUST NOT be redirected. The explicit URL written on the
+requirement takes precedence over any matching source, and tools SHOULD warn
+that the source was not applied.
+
+Sources declared in more than one location by a single tool, for example a
+project-wide table and a per-environment table, MUST be merged entry by entry,
+with the more specific location replacing individual entries of the less
+specific one rather than replacing the table wholesale. Names are compared
+after normalization for the purpose of this merge.
+
+Sources are project-local
+-------------------------
+
+Tools MUST read the ``[sources]`` table only from the ``pyproject.toml`` of
+the project currently being developed. In particular:
+
+* A ``[sources]`` table present in a source tree or source distribution
+  obtained as a dependency MUST NOT be honored.
+
+* A ``[sources]`` table is not inherited from a parent directory, so that a
+  tool MUST NOT search ancestor directories for further tables to merge.
+
+The first of these rules is normative for security reasons. Without it, any
+package on any index could redirect the dependencies of every project that
+installs it. See `Security Implications`_.
+
+Sources and built distributions
+-------------------------------
+
+Build backends MUST NOT read the ``[sources]`` table, and tools MUST NOT use
+it to alter the contents of a built distribution. The core metadata produced
+for a project MUST be identical whether or not the table is present.
+
+The table is part of ``pyproject.toml`` and will therefore appear in source
+distributions. Consumers of such a source distribution MUST ignore it, per
+`Sources are project-local`_.
+
+Disabling sources
+-----------------
+
+Tools that consume ``[sources]`` MUST provide a documented way to ignore the
+table entirely, and SHOULD spell the command-line option ``--no-sources``.
+
+This allows a project to verify that the metadata it publishes resolves on its
+own, without the redirections that make a development checkout work. Such a
+check belongs in the release pipeline of any repository that uses sources.
+
+Reporting
+---------
+
+An unmatched source is inert, so that a typographical error in a key produces
+no symptom beyond the wrong distribution being installed. Tools SHOULD warn
+about entries matching no requirement, and SHOULD provide a way to display,
+for each requirement, which source was applied and what it resolved to.
+
+Interaction with lock files
+---------------------------
+
+Sources are an input to resolution and a :pep:`751` ``pylock.toml`` is an
+output of it, and since that format already records concrete origins
+(``vcs``, ``directory``, ``archive``, and ``index``), a lock file generated
+with sources applied needs no change to it at all. Such a
+lock file is not interchangeable with one generated without them, so that
+tools able to produce both SHOULD write them to distinct
+``pylock.<name>.toml`` files.
+
+
+Examples
+========
+
+A multi-package repository
+--------------------------
+
+Each project declares the requirements it needs in terms that hold for anyone
+installing it from an index, and separately declares where those requirements
+are satisfied from within this checkout. Paths are relative to the directory
+containing each ``pyproject.toml``.
+
+.. code:: toml
+
+    # foo/libs/client/pyproject.toml
+    [project]
+    name = "foo-client"
+    version = "1.4.0"
+    dependencies = ["foo-core>=1.0", "httpx>=0.28"]
+
+    [sources]
+    foo-core = { path = "../core", editable = true }
+
+.. code:: toml
+
+    # foo/services/api/pyproject.toml
+    [project]
+    name = "foo-api"
+    version = "2.1.0"
+    dependencies = ["foo-client>=1.2", "fastapi>=0.115"]
+
+    [sources]
+    foo-client = { path = "../../libs/client", editable = true }
+    foo-core = { path = "../../libs/core", editable = true }
+
+``foo-api`` redirects ``foo-core`` as well as ``foo-client``, since
+``foo-core`` appears in its resolved requirements by way of ``foo-client``
+and tables are not inherited between projects, per `Direct and transitive
+requirements`_ and `Sources are project-local`_. Building ``foo-api``
+produces a wheel whose metadata reads ``Requires-Dist: foo-client>=1.2``, so
+that whoever installs that wheel from an index will resolve ``foo-client``
+from the index, while whoever installs the checkout with a tool that honors
+``[sources]`` will resolve it from ``libs/client``.
+
+Tracking an upstream branch
+---------------------------
+
+.. code:: toml
+
+    [project]
+    dependencies = ["httpx>=0.28"]
+
+    [sources]
+    httpx = { git = "https://github.com/encode/httpx", branch = "master" }
+
+The project continues to advertise ``httpx>=0.28`` to its consumers while its
+developers test against unreleased upstream changes, and deleting the source
+entry is all that is required to revert to the published release.
+
+A private index for internal packages
+-------------------------------------
+
+.. code:: toml
+
+    [project]
+    dependencies = ["foo-core>=1.0", "requests>=2.32"]
+
+    [sources]
+    foo-core = { index = "https://pypi.internal.example.com/simple" }
+
+``foo-core`` resolves only from the internal index while ``requests``
+resolves from the default index, so that neither of the two indexes is in a
+position to serve the other's package.
+
+
+Backwards Compatibility
+=======================
+
+``[sources]`` is a new top-level table. :pep:`518` reserved ``[tool]`` for
+tool-specific configuration and left the remainder of the top-level namespace
+for standardization, which :pep:`735` subsequently used for
+``[dependency-groups]``. Existing ``pyproject.toml`` files are unaffected.
+
+A tool that does not implement this PEP ignores the table and resolves every
+requirement from its configured indexes. In a multi-package repository this
+usually produces a clear failure, because the sibling projects are not
+published. It can also produce a silent difference, when the project is
+published and the installed release is not the working tree. This is the
+behavior of ``[tool.uv.sources]`` and ``[tool.hatch.sources]`` today, so the
+proposal does not introduce a new class of failure, and it reduces how often
+the failure occurs by increasing the number of tools that understand the
+declaration.
+
+Migration from tool-specific tables
+-----------------------------------
+
+Tools that already provide an equivalent table SHOULD support both. The
+recommended behavior is to treat the standard ``[sources]`` table as the base
+and the tool-specific table as an override applied entry by entry, warning
+when both define the same normalized name, so that a repository can migrate
+incrementally.
+
+Audit and update
+----------------
+
+What would need updating is the validators and schema definitions that check
+``pyproject.toml``, the editors and language servers that resolve imports
+between projects in one repository, the dependency auditing and license
+tooling that cannot currently determine that a requirement is satisfied
+locally, and the documentation of the existing implementations.
+
+
+Security Implications
+=====================
+
+Sources name origins from which code will be downloaded and, in the case of
+path, Git, and source-distribution sources, built and executed as well. There
+are three risks here that warrant particular attention.
+
+The first is that a dependency must never be in a position to redirect the
+requirements of whatever depends upon it, if ``[sources]`` tables were
+honored transitively, a package on any index could ship a table redirecting
+``requests``, or any other name it chose, to an attacker-controlled URL for
+every project that installed it. The mitigation is the requirement in
+`Sources are project-local`_ that tools read the table only from the project
+being developed, which is why it is a MUST rather than a SHOULD. What that
+restriction governs is which tables are read and not which requirements those
+tables may affect, so that a project's own table remains free to redirect a
+transitive requirement, per `Direct and transitive requirements`_.
+
+The second is that an index source must restrict resolution rather than widen
+it, since an implementation that satisfies one by adding the URL to the set of
+searched indexes will expose every project resolved by that tool to dependency
+confusion, a public index being free to serve a higher version under the same
+name and thereby win resolution. It is the requirement that an index source
+resolve its project exclusively from the named index that makes this kind of
+source safer than the ad-hoc ``--extra-index-url`` invocations it replaces.
+
+The third is that sources are supply-chain surface like any other. A Git or
+URL source can point anywhere at all, and a path source may traverse above
+the repository, which is no broader an exposure than :pep:`508` direct
+references already permit, though the table is terse and easily skimmed past
+in review. Tools SHOULD therefore display the resolved absolute location of
+each applied source, and particularly so when a relative path escapes the
+directory containing the ``pyproject.toml``.
+
+
+How to Teach This
+=================
+
+Teaching the feature is largely a matter of holding two questions apart from
+one another, the first being what a package requires, which is published, and
+the second being where those requirements are obtained from while the package
+is being worked on, which is not.
+
+For multi-package repositories the example in `Examples`_ is the teaching
+case, in which one declares the real requirement in ``[project]``, declares
+the local path in ``[sources]``, and then observes that the built wheel has
+not changed. There are two points here that are worth dwelling on. The first
+is that a project must redirect the transitive requirements it wants
+satisfied locally and not merely the direct ones, which is the part that
+surprises people. The second is that ``--no-sources`` reproduces whatever a
+consumer of the package would see, so that the question of whether one's
+published metadata still resolves becomes a single command in CI.
+
+As for those who are currently writing ``name @ file:///...`` into
+``[project.dependencies]``, it is ``[sources]`` that the line belonged in all
+along.
+
+
+Reference Implementation
+========================
+
+Two production implementations of the design exist, which between them cover
+every source kind specified here:
+`uv <https://docs.astral.sh/uv/concepts/projects/dependencies/#dependency-sources>`__,
+whose ``[tool.uv.sources]`` carries marker- and extra-conditional entries and
+a ``--no-sources`` switch, and
+`Hatch <https://hatch.pypa.io/latest/config/environment/sources/>`__, whose
+``[tool.hatch.sources]`` carries the string shorthand and entry-by-entry
+merging. Since both already parse the same shapes, adapting either to read
+the standard table is mechanical, and a prototype in Hatch is planned
+alongside discussion of this PEP. Where the behavior specified here differs
+from one or both of them, that difference is recorded in `Open Issues`_.
+
+
+Rejected Ideas
+==============
+
+Leave it in ``[tool]``
+----------------------
+
+The status quo serves users of a single tool and no one else, the information
+being a property of the repository rather than of a tool, so that the cost of
+leaving it in a vendor namespace falls on every non-manager tool that needs to
+understand a checkout and on every project that later wants to change tools.
+
+Extend the dependency specifier syntax instead
+----------------------------------------------
+
+Allowing ``foo-core @ ../libs/core`` in ``[project.dependencies]`` would put
+the redirection where the dependency already is, but it would put it in
+published metadata, which is the problem this PEP exists to solve. It would
+also require changing :pep:`508`, and therefore every parser of every
+dependency specifier in the ecosystem, in order to express something that has
+no meaning outside the authoring repository.
+
+Put the table under ``[project]``
+---------------------------------
+
+``[project.sources]`` would be the only key in ``[project]`` that build
+backends must ignore, and it would be unusable in a repository root that has
+no ``[project]`` table.
+
+Let sources affect published metadata
+-------------------------------------
+
+Some projects want to publish a distribution that depends on a Git revision,
+which :pep:`508` direct references already express, and which is appropriate
+there because they are published and therefore visible to consumers.
+Overloading ``[sources]`` to sometimes publish would remove the invariant that
+makes the table safe to add to an existing project.
+
+Inherit sources from ancestor directories
+-----------------------------------------
+
+Allowing a project to inherit ``[sources]`` from the nearest ancestor
+``pyproject.toml`` would spare each project in a repository from naming the
+same redirections, but it was rejected because implicit upward traversal has
+no natural stopping point, so that a stray ``pyproject.toml`` in a home
+directory would silently alter resolution for every project beneath it, and
+the boundary would have to be drawn in terms of something outside packaging
+altogether, such as a version control directory.
+
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
