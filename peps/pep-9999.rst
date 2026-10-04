@@ -29,9 +29,9 @@ Motivation
 ==========
 
 There is no standard way to say that a dependency should come from somewhere
-other than an index while a project is being developed. Each project manager
-that supports multi-package repositories has added its own table for this, and
-none of them read each other's.
+other than an index while a project is being developed. Several project
+managers have added their own tables for this, and none of them read each
+other's.
 
 Multi-package repositories
 --------------------------
@@ -140,7 +140,9 @@ declared elsewhere should be fetched from. ``[project.dependencies]`` remains
 the complete published statement of what a project needs, and the tool that
 sets up the development environment applies ``[sources]`` on top of it.
 
-This preserves an invariant that the direct-reference approach violates:
+Direct references write development-only paths and URLs into published
+metadata. Keeping them in a separate table instead gives this PEP its central
+invariant:
 
     The metadata of a built distribution is identical whether or not a
     ``[sources]`` table is present.
@@ -156,9 +158,9 @@ Why a top-level table rather than a key in ``[project]``
 
 ``[project]`` is, by :pep:`621`, the set of fields a build backend reads and
 translates into core metadata. Sources are never translated into core
-metadata, so a ``[project.sources]`` key would be the only member of that
-table that backends are required to ignore, which invites implementation
-errors and conflicts with the ``dynamic`` mechanism.
+metadata, so ``[project.sources]`` would be the only key in that table that
+backends must ignore. Existing validators, such as validate-pyproject, also
+reject keys in ``[project]`` that the specification does not define.
 
 A repository root often has no ``[project]`` table and holds only
 repository-wide configuration such as ``[dependency-groups]``. Sources need to
@@ -350,10 +352,9 @@ under which the entry applies.
 
 When the value of a key in ``[sources]`` is an array, entries are considered
 in order and the first entry whose selectors all match is applied. If no entry
-matches, the requirement is not redirected. Tools SHOULD warn when more than
-one entry in an array could apply to the same requirement in the same
-environment, since such a table is usually a mistake even though its meaning
-is well defined.
+matches, the requirement is not redirected. An entry with no selectors always
+matches, so any entry after it can never be applied. Tools SHOULD warn about
+such entries.
 
 .. code:: toml
 
@@ -368,8 +369,8 @@ Applying sources
 ----------------
 
 A source applies to a requirement when the requirement's project name, after
-normalization, equals the normalized key of the source, and the selectors of
-the applicable entry match.
+normalization, equals the normalized key of the source, and one of the
+source's entries matches under the rules in `Selectors`_.
 
 Sources MUST be applied to requirements appearing in:
 
@@ -380,11 +381,12 @@ Sources MUST be applied to requirements appearing in:
 Tools MAY additionally apply sources to development dependency lists of their
 own definition, such as per-environment requirement lists.
 
-Sources MUST NOT be applied to ``build-system.requires``. Which backend, and
-which version of that backend, builds a distribution is a property of the
-distribution produced, and allowing a development-only table to change it
-would break the invariant that ``[sources]`` cannot affect build output. uv
-currently behaves otherwise; see `Reference Implementation`_.
+Sources MUST NOT be applied to ``build-system.requires``. Build requirements
+decide which backend builds a distribution, and which version of it. If
+sources could redirect them, the same source tree could produce a different
+distribution depending on whether ``[sources]`` was honored, which
+`Sources and built distributions`_ does not allow. uv currently applies
+sources to build requirements by default; see `Reference Implementation`_.
 
 Direct and transitive requirements
 ''''''''''''''''''''''''''''''''''
@@ -431,11 +433,11 @@ A requirement that already carries a :pep:`508` direct reference
 requirement takes precedence over any matching source, and tools SHOULD warn
 that the source was not applied.
 
-Sources declared in more than one location by a single tool, for example a
-project-wide table and a per-environment table, MUST be merged entry by entry,
-with the more specific location replacing individual entries of the less
-specific one rather than replacing the table wholesale. Names are compared
-after normalization for the purpose of this merge.
+When a tool reads sources from more than one location, for example a
+project-wide table and a per-environment table, it MUST merge them entry by
+entry, with the more specific location replacing individual entries of the
+less specific one rather than replacing the table wholesale. Names are
+compared after normalization for the purpose of this merge.
 
 Sources are project-local
 -------------------------
@@ -449,9 +451,9 @@ the project currently being developed. In particular:
 * A ``[sources]`` table is not inherited from a parent directory. Tools MUST
   NOT search ancestor directories for further tables to merge.
 
-The first of these rules is normative for security reasons. Without it, any
-package on any index could redirect the dependencies of every project that
-installs it. See `Security Implications`_.
+The first rule exists for security reasons. Without it, any package on any
+index could redirect the dependencies of every project that installs it. See
+`Security Implications`_.
 
 Sources and built distributions
 -------------------------------
@@ -470,7 +472,7 @@ Disabling sources
 Tools that consume ``[sources]`` MUST provide a documented way to ignore the
 table entirely, and SHOULD spell the command-line option ``--no-sources``.
 
-This allows a project to verify that the metadata it publishes resolves on its
+This lets a project check that the dependencies it publishes resolve on their
 own, without the redirections that make a development checkout work. Such a
 check belongs in the release pipeline of any repository that uses sources.
 
@@ -609,8 +611,9 @@ The following would need updating:
 Security Implications
 =====================
 
-Sources name origins from which code will be downloaded and, for path, Git,
-and source-distribution sources, built and executed.
+Sources decide where installed code comes from. A source that points at a
+project directory, a Git repository, or a source distribution also causes that
+code to be built, which can run arbitrary code.
 
 Sources in dependencies
 -----------------------
@@ -655,7 +658,7 @@ in ``[project]``, declare the local path in ``[sources]``, and check that the
 built wheel is unchanged. Users should know that a project has to redirect
 every in-repository package it depends on, including indirect ones, and that
 ``--no-sources`` shows what a consumer of the package will see, which makes it
-easy to check in CI that the published metadata still resolves.
+easy to check in CI that the published dependencies still resolve.
 
 Projects that currently write ``name @ file:///...`` into
 ``[project.dependencies]`` should move that redirection into ``[sources]``.
